@@ -2,18 +2,15 @@
 
 Snow Atlas ist ein erster Full-Stack-MVP für die Frage: **Wo liegt an meinem Ziel aktuell Schnee?**
 
-Der Nutzer startet ohne Karte, sucht einen Ort, eine Adresse oder Koordinaten und erhält anschließend eine interaktive Satellitenkarte. FSC- und GFSC-Schneedaten von WEkEO werden als anklickbare Abschnitte dargestellt. Pro Abschnitt zeigt die Oberfläche Schneebedeckung, Beobachtungszeit/AT, Wolken beziehungsweise AT-Zeitraum, native Auflösung und Anteil gültiger Pixel.
+Der Nutzer startet ohne Karte, sucht einen Ort, eine Adresse oder Koordinaten und erhält anschließend eine interaktive Karte. FSC- und GFSC-Schneedaten von WEkEO liegen als Rasterebene darüber. Ein Klick zeigt für den Abschnitt an dieser Stelle Schneebedeckung, Beobachtungszeit/AT, Wolken beziehungsweise AT-Zeitraum, native Auflösung und Anteil gültiger Pixel.
 
-## Aktueller Testfall
+## So funktioniert es
 
-Der vorbereitete reale Datenausschnitt deckt **Farchant bis Hoher Fricken** ab:
-
-- FSC-Quelldaten: 20 m, Anzeigeabschnitte ca. 100 m
-- GFSC-Quelldaten: 60 m, Anzeigeabschnitte ca. 120 m
-- Suche nach `Farchant`, `Hoher Fricken`, Koordinaten oder einer Adresse
-- 31.619 lokal vorbereitete, anklickbare Abschnitte
-- private Web-Vorschau mit einem kompakten echten WEkEO-Snapshot in 240-m-Abschnitten
-- aktuell erkanntes Ergebnis im Ausschnitt: 0 % Schnee; die App zeigt bewusst keine erfundene Schneeauflage
+- Das Backend lädt pro Sentinel-2-Kachel (ca. 110 × 110 km) die neueste FSC- (20 m, Tagesaufnahme) und GFSC-Szene (60 m, lückengefüllt über 7 Tage) von WEkEO und legt die GeoTIFFs unter `backend/data/scenes/` ab.
+- Die Karte zeigt die Schneebedeckung als Rasterkacheln (`/api/v1/snow/tiles/…`), die das Backend direkt aus den GeoTIFFs rendert. Standard ist **FSC + GFSC kombiniert**: FSC hat Vorrang, wo FSC Wolken sieht, füllt GFSC auf.
+- Farbskala in vier Stufen (1–25 / 26–50 / 51–75 / 76–100 %), hell nach dunkel. 0 % bleibt transparent, Wolken sind schraffiert, Bereiche ohne Daten grau abgedunkelt.
+- Ein Klick auf die Karte fragt den 100-m-Abschnitt (FSC) bzw. 120-m-Abschnitt (GFSC) an dieser Stelle ab.
+- Liegt ein gesuchter Ort außerhalb der geladenen Szenen, lädt die App die passenden Szenen automatisch von WEkEO nach (meist 1–3 Minuten, ca. 10–20 MB).
 
 ## Architektur
 
@@ -21,9 +18,10 @@ Der vorbereitete reale Datenausschnitt deckt **Farchant bis Hoher Fricken** ab:
 app/, components/, lib/       React/Vinext-Frontend mit MapLibre
 backend/app/api/              FastAPI-Endpunkte
 backend/app/providers/        WEkEO/HDA-Zugriff
-backend/app/processing/       GeoTIFF- und AT-Verarbeitung
-backend/app/jobs/             kleine, einzeln ausführbare Datenjobs
-backend/app/storage/          lokaler GeoJSON-Speicher
+backend/app/processing/       Szenen-Import, Kachel-Rendering, Abschnittsstatistik
+backend/app/services/         Snow-Service und Download-Jobs für neue Gebiete
+backend/app/storage/          Szenenkatalog (backend/data/scenes/catalog.json)
+backend/app/jobs/             CLI-Job prepare_area
 ```
 
 Die Zugangsdaten bleiben ausschließlich im Python-Backend. `backend/.env`, Downloads und verarbeitete Daten sind von Git ausgeschlossen.
@@ -31,6 +29,8 @@ Die Zugangsdaten bleiben ausschließlich im Python-Backend. `backend/.env`, Down
 ## Lokal starten
 
 Voraussetzungen: Python 3.12+, Node.js 22.13+ und pnpm.
+
+Einmalig einrichten:
 
 ```bash
 cp backend/.env.example backend/.env
@@ -46,40 +46,36 @@ HDA_USER=...
 HDA_PASSWORD=...
 ```
 
-Echte Daten für den Farchant-Testausschnitt laden und hochauflösend vorbereiten:
+Danach startet ein Befehl Backend und Frontend zusammen und öffnet den Browser (beenden mit Ctrl+C):
+
+```bash
+./start.sh
+```
+
+Mit `./start.sh --no-open` öffnet sich kein Browser. Läuft einer der Dienste schon, verwendet das Skript ihn weiter.
+
+Neueste Szenen für ein Gebiet vorab laden, zum Beispiel für das Wettersteingebirge mit Zugspitze:
 
 ```bash
 cd backend
-../.venv/bin/python -m app.jobs.prepare_area \
-  --bbox 11.02 47.45 11.19 47.59
+../.venv/bin/python -m app.jobs.prepare_area --bbox 10.90 47.38 11.20 47.60
 ```
 
-Bereits geladene ZIPs lassen sich ohne neuen WEkEO-Download erneut verarbeiten:
+Bereits heruntergeladene ZIPs (`backend/data/raw`, `backend/data/smoke`) ohne neuen WEkEO-Download importieren:
 
 ```bash
-../.venv/bin/python -m app.jobs.prepare_area \
-  --bbox 11.02 47.45 11.19 47.59 \
-  --reuse-latest
+../.venv/bin/python -m app.jobs.prepare_area --reuse-latest
 ```
-
-Backend und Frontend in zwei Terminals starten:
-
-```bash
-cd backend
-../.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-```bash
-pnpm dev
-```
-
-Danach `http://localhost:5173` öffnen und nach **Farchant** suchen.
 
 ## API
 
 - `GET /api/v1/health`
-- `GET /api/v1/snow/status`
-- `GET /api/v1/snow/cells?west=…&south=…&east=…&north=…`
+- `GET /api/v1/snow/status`: geladene Szenen und Datenversion
+- `GET /api/v1/snow/tiles/{combined|FSC|GFSC}/{z}/{x}/{y}.png?clouds=1`
+- `GET /api/v1/snow/point?lon=…&lat=…`: Abschnittswerte für FSC und GFSC
+- `GET /api/v1/snow/summary?west=…&south=…&east=…&north=…&mode=combined`: Schneefläche, Wolken und fehlende Daten im Ausschnitt
+- `GET /api/v1/snow/coverage`: Umrisse der geladenen Szenen
+- `POST /api/v1/snow/areas` mit `{"longitude": …, "latitude": …}` und `GET /api/v1/snow/areas/{id}`: Szenen für einen Ort nachladen
 - `GET /api/v1/geocode/search?q=…`
 - Swagger UI: `http://127.0.0.1:8000/docs`
 
@@ -92,13 +88,12 @@ Die freie Adresssuche nutzt die öffentliche Nominatim-Instanz nur nach ausdrüc
 ## Datenjobs
 
 - `smoke_test_wekeo.py`: Login, Suche, Download-URL und optionaler Beispieldownload
-- `app.jobs.prepare_area`: sucht/lädt FSC und GFSC und bereitet einen kleinen hochauflösenden Suchausschnitt vor
-- `app.jobs.refresh_snow`: allgemeiner, gröberer Refresh
-- `app.jobs.seed_from_samples`: verarbeitet vorhandene Smoke-Test-ZIPs
+- `app.jobs.prepare_area`: lädt die neuesten FSC/GFSC-Szenen für eine Bounding Box oder importiert vorhandene ZIPs (`--reuse-latest`)
 
 ## MVP-Grenzen
 
 - Der Python-Dienst läuft derzeit lokal und ist noch nicht separat gehostet.
-- Die private Web-Vorschau nutzt für Farchant/Hoher Fricken einen klar markierten, echten WEkEO-Snapshot; die lokale Version lädt den feineren 100/120-m-Ausschnitt über die Python-API.
-- Der vorbereitete echte Datensatz ist auf Farchant/Hoher Fricken begrenzt. Weitere Orte benötigen einen neuen `prepare_area`-Lauf oder später einen Queue-/Cache-Dienst.
+- Die private Web-Vorschau hat kein Backend und zeigt nur den klar markierten Farchant-Snapshot (`public/data/farchant-snow.geojson`). Alle anderen Orte brauchen das lokale Backend.
+- Neue Gebiete werden in einem einfachen In-Process-Job nachgeladen (ein Download gleichzeitig, Jobstatus nur im Speicher). Für mehrere Nutzer braucht es später eine echte Queue.
+- Pro Sentinel-2-Kachel wird immer die neueste Szene angezeigt. Ist sie bewölkt, füllt GFSC die Lücken; ältere wolkenfreie FSC-Szenen werden nicht nachgemischt.
 - Die App visualisiert Schneelage, aber plant noch keine Wanderroute und ersetzt keine Lawinen- oder Sicherheitsinformation.

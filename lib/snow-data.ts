@@ -4,7 +4,7 @@ export type SnowCellProperties = {
   cell_id: string
   region_name: string
   product: SnowProduct
-  coverage_percent: number
+  coverage_percent: number | null
   observed_at: string
   oldest_observed_at?: string | null
   valid_percent?: number | null
@@ -19,6 +19,7 @@ export type SnowCellProperties = {
   source?: string | null
   source_product_id?: string | null
   quality_good_percent?: number | null
+  water_percent?: number | null
 }
 
 export type SnowCellFeature = {
@@ -30,6 +31,37 @@ export type SnowCellFeature = {
     coordinates: number[][][]
   }
 }
+
+export type SnowPointResult = {
+  longitude: number
+  latitude: number
+  covered: boolean
+  cells: Partial<Record<SnowProduct, SnowCellFeature>>
+  data_version: string
+}
+
+export type SnowAreaSummary = {
+  snow_area_percent: number | null
+  mean_coverage_percent: number | null
+  valid_percent: number
+  cloud_percent: number
+  nodata_percent: number
+}
+
+export type SnowAreaJob = {
+  id: string
+  state: "running" | "done" | "failed"
+  message: string
+}
+
+// Ordinal one-hue ramp, light -> dark = little -> much snow. Must match
+// SNOW_CLASSES in backend/app/processing/snow_raster.py.
+export const snowClasses = [
+  { min: 1, label: "1–25", color: "#86b6ef" },
+  { min: 26, label: "26–50", color: "#3987e5" },
+  { min: 51, label: "51–75", color: "#1c5cab" },
+  { min: 76, label: "76–100", color: "#0d366b" },
+] as const
 
 export type SnowFeatureCollection = {
   type: "FeatureCollection"

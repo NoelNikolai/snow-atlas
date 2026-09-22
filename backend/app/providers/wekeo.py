@@ -59,25 +59,26 @@ class WekeoProvider:
             "enddate": end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.999Z"),
         }
         results = self.client.search(query, limit=limit)
-        matches = [self._to_match(product, dataset_id, raw) for raw in results.results]
+        matches = [self._to_match(product, dataset_id, raw, index) for index, raw in enumerate(results.results)]
         matches.sort(key=lambda item: item.observed_at or datetime.min.replace(tzinfo=UTC), reverse=True)
         return results, matches
 
-    def download_first(self, search_results: Any, destination: Path) -> Path:
+    def download(self, search_results: Any, match: ProductMatch, destination: Path) -> Path:
         destination.mkdir(parents=True, exist_ok=True)
+        cached = destination / f"{match.product_id}.zip"
+        if cached.is_file():
+            return cached
         before = set(destination.glob("*.zip"))
-        search_results[:1].download(download_dir=str(destination))
-        after = set(destination.glob("*.zip"))
-        created = sorted(after - before, key=lambda path: path.stat().st_mtime, reverse=True)
+        search_results[match.index : match.index + 1].download(download_dir=str(destination))
+        created = sorted(set(destination.glob("*.zip")) - before, key=lambda path: path.stat().st_mtime, reverse=True)
+        if cached.is_file():
+            return cached
         if created:
             return created[0]
-        existing = sorted(after, key=lambda path: path.stat().st_mtime, reverse=True)
-        if not existing:
-            raise FileNotFoundError("WEkEO download completed without a ZIP product")
-        return existing[0]
+        raise FileNotFoundError(f"WEkEO download of {match.product_id} completed without a ZIP product")
 
     @staticmethod
-    def _to_match(product: str, dataset_id: str, raw: dict[str, Any]) -> ProductMatch:
+    def _to_match(product: str, dataset_id: str, raw: dict[str, Any], index: int) -> ProductMatch:
         properties = raw.get("properties", {})
         size = properties.get("size")
         return ProductMatch(
@@ -87,4 +88,5 @@ class WekeoProvider:
             observed_at=parse_observed_at(str(raw.get("id", ""))),
             size_bytes=int(size) if isinstance(size, (int, float)) else None,
             raw=raw,
+            index=index,
         )

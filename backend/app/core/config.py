@@ -29,10 +29,9 @@ class Settings(BaseSettings):
     gfsc_dataset_id: str = "EO:CLMS:DAT:GFSC_EUROPE_60M_DAILY_V1"
 
     data_dir: Path = Field(default=BACKEND_ROOT / "data")
-    snow_cell_size_m: int = 5_040
-    snow_min_percent: float = 2.0
+    fsc_cell_m: int = 100
+    gfsc_cell_m: int = 120
     refresh_lookback_days: int = 14
-    default_bbox: str = "5.7,45.5,16.0,48.5"
 
     @property
     def credentials_configured(self) -> bool:
@@ -43,15 +42,8 @@ class Settings(BaseSettings):
         return [value.strip() for value in self.cors_origins.split(",") if value.strip()]
 
     @property
-    def default_bbox_values(self) -> list[float]:
-        values = [float(value.strip()) for value in self.default_bbox.split(",")]
-        if len(values) != 4:
-            raise ValueError("DEFAULT_BBOX must contain west,south,east,north")
-        return values
-
-    @property
-    def processed_geojson(self) -> Path:
-        return self.data_dir / "processed" / "snow_cells.geojson"
+    def scenes_dir(self) -> Path:
+        return self.data_dir / "scenes"
 
     def dataset_id(self, product: str) -> str:
         if product.upper() == "FSC":

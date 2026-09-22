@@ -14,6 +14,14 @@ class ProductMatch:
     observed_at: datetime | None
     size_bytes: int | None
     raw: dict[str, Any]
+    index: int = 0
+
+    def covers(self, longitude: float, latitude: float) -> bool:
+        bbox = self.raw.get("bbox")
+        if not bbox or len(bbox) != 4:
+            return True
+        west, south, east, north = bbox
+        return west <= longitude <= east and south <= latitude <= north
 
 
 class SnowArchiveProvider(Protocol):
@@ -26,4 +34,4 @@ class SnowArchiveProvider(Protocol):
         limit: int = 3,
     ) -> tuple[Any, list[ProductMatch]]: ...
 
-    def download_first(self, search_results: Any, destination: Path) -> Path: ...
+    def download(self, search_results: Any, match: ProductMatch, destination: Path) -> Path: ...

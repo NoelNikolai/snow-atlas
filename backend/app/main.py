@@ -14,13 +14,13 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
-    description="Local API for FSC/GFSC snow cells.",
+    description="Local API for FSC/GFSC snow tiles, cell statistics and on-demand WEkEO areas.",
 )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 app.include_router(health_router, prefix="/api/v1")

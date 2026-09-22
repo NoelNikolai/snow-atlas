@@ -1,83 +1,58 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from app.core.config import get_settings
-from app.jobs.fetch_products import fetch_latest_product
-from app.processing.raster_to_cells import merge_feature_collections, process_product_zip
-from app.storage.local_store import LocalGeoJsonStore
+from app.jobs.fetch_products import fetch_newest_scenes
+from app.processing.scenes import import_archive
+from app.storage.scene_catalog import Scene, SceneCatalog
 
 
-def _latest_local_archive(data_dir: Path, product: str) -> Path:
-    archives = sorted((data_dir / "raw" / product.lower()).glob("*.zip"))
-    if not archives:
-        raise FileNotFoundError(
-            f"No cached {product} archive found. Run without --reuse-latest first."
-        )
-    return archives[-1]
+def import_local_archives() -> list[Scene]:
+    """Register every WEkEO ZIP already on disk (data/raw and data/smoke) without downloading."""
 
-
-def prepare_area(
-    products: list[str],
-    bbox: list[float],
-    lookback_days: int,
-    reuse_latest: bool,
-    fsc_cell_m: int,
-    gfsc_cell_m: int,
-) -> dict:
     settings = get_settings()
-    collections = []
-    for product in products:
-        archive = (
-            _latest_local_archive(settings.data_dir, product)
-            if reuse_latest
-            else fetch_latest_product(settings, product, bbox, lookback_days)[0]
-        )
-        collections.append(
-            process_product_zip(
-                archive,
-                product,
-                cell_size_m=fsc_cell_m if product == "FSC" else gfsc_cell_m,
-                minimum_snow_percent=0,
-                bbox=bbox,
-            )
-        )
-
-    merged = merge_feature_collections(collections)
-    merged["metadata"].update(
-        {
-            "bbox": bbox,
-            "purpose": "search-area",
-            "display_cell_size_m": {"FSC": fsc_cell_m, "GFSC": gfsc_cell_m},
-        }
+    catalog = SceneCatalog(settings.scenes_dir)
+    archives = sorted(
+        [*settings.data_dir.glob("raw/*/*.zip"), *settings.data_dir.glob("smoke/*.zip")]
     )
-    LocalGeoJsonStore(settings.processed_geojson).write(merged)
-    return merged
+    if not archives:
+        raise FileNotFoundError("No cached archives found. Run with --bbox first.")
+    scenes = []
+    for archive in archives:
+        scene = import_archive(archive, catalog)
+        print(f"{scene.product:<4} {scene.tile_id} {scene.observed_at}  {archive.name}")
+        scenes.append(scene)
+    return scenes
 
 
 def main() -> None:
     settings = get_settings()
     parser = argparse.ArgumentParser(
-        description="Prepare a high-resolution Snow Atlas search area"
+        description="Download the newest FSC/GFSC scenes for an area and prepare them for map tiles"
     )
     parser.add_argument("--product", action="append", choices=["FSC", "GFSC"])
-    parser.add_argument("--bbox", nargs=4, type=float, required=True)
+    parser.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
     parser.add_argument("--lookback-days", type=int, default=settings.refresh_lookback_days)
-    parser.add_argument("--reuse-latest", action="store_true")
-    parser.add_argument("--fsc-cell-m", type=int, default=100)
-    parser.add_argument("--gfsc-cell-m", type=int, default=120)
+    parser.add_argument(
+        "--reuse-latest",
+        action="store_true",
+        help="only import ZIPs that are already downloaded, no WEkEO request",
+    )
     args = parser.parse_args()
 
-    result = prepare_area(
-        products=args.product or ["FSC", "GFSC"],
-        bbox=args.bbox,
-        lookback_days=args.lookback_days,
-        reuse_latest=args.reuse_latest,
-        fsc_cell_m=args.fsc_cell_m,
-        gfsc_cell_m=args.gfsc_cell_m,
-    )
-    print(f"Snow cells written: {len(result['features'])}")
+    if args.reuse_latest:
+        scenes = import_local_archives()
+    else:
+        if not args.bbox:
+            parser.error("--bbox is required unless --reuse-latest is given")
+        scenes = fetch_newest_scenes(
+            settings,
+            bbox=args.bbox,
+            products=args.product or ["FSC", "GFSC"],
+            lookback_days=args.lookback_days,
+        )
+    print(f"Scenes ready: {len(scenes)} → {settings.scenes_dir}")
 
 
 if __name__ == "__main__":

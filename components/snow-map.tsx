@@ -2,16 +2,20 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
+  ChevronDown,
   Clock3,
   Cloud,
+  CloudDownload,
   Crosshair,
   Database,
   Layers3,
+  LoaderCircle,
   LocateFixed,
   Map as MapIcon,
   Minus,
   MountainSnow,
   Plus,
+  RefreshCw,
   Search,
   Snowflake,
 } from "lucide-react"
@@ -20,6 +24,7 @@ import {
   Map as MapLibreMap,
   Marker,
   type GeoJSONSource,
+  type RasterTileSource,
   type StyleSpecification,
 } from "maplibre-gl"
 
@@ -27,14 +32,19 @@ import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 import {
   alpinePlaces,
-  demoSnowData,
+  snowClasses,
+  type SnowAreaJob,
+  type SnowAreaSummary,
+  type SnowCellFeature,
   type SnowCellProperties,
   type SnowFeatureCollection,
+  type SnowPointResult,
   type SnowProduct,
 } from "@/lib/snow-data"
 
 type BasemapMode = "satellite" | "map"
-type DataMode = "demo" | "snapshot" | "live"
+type DataMode = "idle" | "loading" | "live" | "snapshot" | "preparing" | "unavailable"
+type SnowCells = Partial<Record<SnowProduct, SnowCellFeature>>
 
 type NominatimResult = {
   display_name: string
@@ -59,8 +69,10 @@ declare global {
   }
 }
 
-const snowLayerIds = ["snow-fill", "snow-edge-outer", "snow-edge-inner"]
+const snapshotLayerIds = ["snow-fill"]
 const farchantSnapshotBounds = [11.045, 47.485, 11.225, 47.575] as const
+const emptySnowData: SnowFeatureCollection = { type: "FeatureCollection", features: [] }
+const emptySelection: SnowFeatureCollection = { type: "FeatureCollection", features: [] }
 
 function insideFarchantSnapshot([longitude, latitude]: [number, number]) {
   const [west, south, east, north] = farchantSnapshotBounds
@@ -127,80 +139,101 @@ function baseStyle(mode: BasemapMode): StyleSpecification | string {
   return mode === "satellite" ? satelliteStyle() : "https://tiles.openfreemap.org/styles/liberty"
 }
 
-function addSnowLayers(map: MapLibreMap, data: SnowFeatureCollection) {
-  if (map.getSource("snow-cells")) return
-  map.addSource("snow-cells", { type: "geojson", data, promoteId: "cell_id" })
+/** Snow sits under the basemap's labels so place names stay readable. */
+function firstLabelLayer(map: MapLibreMap) {
+  return map.getStyle().layers.find((layer) => layer.type === "symbol")?.id
+}
 
-  map.addLayer({
-    id: "snow-fill",
-    type: "fill",
-    source: "snow-cells",
-    paint: {
-      "fill-color": [
-        "interpolate", ["linear"], ["get", "coverage_percent"],
-        0, "#8cd6eb", 55, "#c9f0f7", 100, "#ffffff",
-      ],
-      "fill-opacity": [
-        "interpolate", ["linear"], ["get", "coverage_percent"],
-        0, 0.035, 1, 0.1, 20, 0.18, 100, 0.52,
-      ],
-      "fill-outline-color": "rgba(255,255,255,0)",
-    },
-  })
-  map.addLayer({
-    id: "snow-edge-outer",
-    type: "line",
-    source: "snow-cells",
-    paint: {
-      "line-color": "rgba(255,255,255,0.92)",
-      "line-width": ["interpolate", ["linear"], ["zoom"], 9, 1.2, 14, 4],
-      "line-opacity": ["interpolate", ["linear"], ["get", "coverage_percent"], 0, 0.11, 1, 0.36, 100, 0.76],
-      "line-blur": 0.3,
-    },
-  })
-  map.addLayer({
-    id: "snow-edge-inner",
-    type: "line",
-    source: "snow-cells",
-    paint: {
-      "line-color": ["match", ["get", "product"], "FSC", "#eafcff", "#6ee7ff"],
-      "line-width": ["interpolate", ["linear"], ["zoom"], 9, 0.5, 14, 2.2],
-      "line-opacity": ["interpolate", ["linear"], ["get", "coverage_percent"], 0, 0.08, 1, 0.55, 100, 1],
-      "line-dasharray": [1.2, 1.5],
-    },
-  })
-  map.addLayer({
-    id: "snow-selected",
-    type: "line",
-    source: "snow-cells",
-    filter: ["==", ["get", "cell_id"], ""],
-    paint: {
-      "line-color": "#ffffff",
-      "line-width": 3,
-      "line-offset": 4,
-      "line-opacity": 0.95,
-    },
-  })
+function snowMode(products: Record<SnowProduct, boolean>) {
+  if (products.FSC && products.GFSC) return "combined"
+  if (products.FSC) return "FSC"
+  if (products.GFSC) return "GFSC"
+  return null
+}
+
+function tileUrl(apiBase: string, products: Record<SnowProduct, boolean>, clouds: boolean, version: string) {
+  const mode = snowMode(products) ?? "combined"
+  return `${apiBase}/api/v1/snow/tiles/${mode}/{z}/{x}/{y}.png?clouds=${clouds ? 1 : 0}&v=${version}`
+}
+
+function addSnowLayers(
+  map: MapLibreMap,
+  source: { kind: "raster"; url: string; visible: boolean } | { kind: "geojson"; data: SnowFeatureCollection },
+) {
+  const beforeId = firstLabelLayer(map)
+  if (source.kind === "raster" && !map.getSource("snow-raster")) {
+    map.addSource("snow-raster", { type: "raster", tiles: [source.url], tileSize: 256, minzoom: 5, maxzoom: 15 })
+    map.addLayer({
+      id: "snow-raster",
+      type: "raster",
+      source: "snow-raster",
+      layout: { visibility: source.visible ? "visible" : "none" },
+      paint: { "raster-resampling": "nearest", "raster-fade-duration": 0 },
+    }, beforeId)
+  }
+  if (source.kind === "geojson" && !map.getSource("snow-cells")) {
+    map.addSource("snow-cells", { type: "geojson", data: source.data, promoteId: "cell_id" })
+    map.addLayer({
+      id: "snow-fill",
+      type: "fill",
+      source: "snow-cells",
+      paint: {
+        "fill-color": [
+          "step", ["coalesce", ["get", "coverage_percent"], 0],
+          snowClasses[0].color,
+          snowClasses[1].min, snowClasses[1].color,
+          snowClasses[2].min, snowClasses[2].color,
+          snowClasses[3].min, snowClasses[3].color,
+        ],
+        // 0 % stays clickable but invisible: no snow means no paint.
+        "fill-opacity": ["case", [">", ["coalesce", ["get", "coverage_percent"], 0], 0], 0.86, 0],
+      },
+    }, beforeId)
+  }
+  if (!map.getSource("snow-selection")) {
+    map.addSource("snow-selection", { type: "geojson", data: emptySelection })
+    map.addLayer({
+      id: "snow-selection-casing",
+      type: "line",
+      source: "snow-selection",
+      paint: { "line-color": "#08161c", "line-width": 5, "line-opacity": 0.75 },
+    }, beforeId)
+    map.addLayer({
+      id: "snow-selection",
+      type: "line",
+      source: "snow-selection",
+      paint: { "line-color": "#ffffff", "line-width": 2 },
+    }, beforeId)
+  }
 }
 
 function toProperties(properties: Record<string, unknown>): SnowCellProperties {
+  const number = (value: unknown) => value == null ? null : Number(value)
   return {
     cell_id: String(properties.cell_id),
     region_name: String(properties.region_name),
     product: String(properties.product) as SnowProduct,
-    coverage_percent: Number(properties.coverage_percent),
+    coverage_percent: number(properties.coverage_percent),
     observed_at: String(properties.observed_at),
     oldest_observed_at: properties.oldest_observed_at == null ? null : String(properties.oldest_observed_at),
-    valid_percent: properties.valid_percent == null ? null : Number(properties.valid_percent),
-    snow_pixel_percent: properties.snow_pixel_percent == null ? null : Number(properties.snow_pixel_percent),
-    cloud_percent: properties.cloud_percent == null ? null : Number(properties.cloud_percent),
+    valid_percent: number(properties.valid_percent),
+    snow_pixel_percent: number(properties.snow_pixel_percent),
+    cloud_percent: number(properties.cloud_percent),
     resolution_m: Number(properties.resolution_m),
-    cell_size_m: properties.cell_size_m == null ? null : Number(properties.cell_size_m),
+    cell_size_m: number(properties.cell_size_m),
     source_layer: properties.source_layer == null ? null : String(properties.source_layer),
     product_date: properties.product_date == null ? null : String(properties.product_date),
-    elevation_m: properties.elevation_m == null ? null : Number(properties.elevation_m),
+    elevation_m: number(properties.elevation_m),
     confidence: String(properties.confidence) as "hoch" | "mittel",
   }
+}
+
+/** Mirrors the tile compositing: FSC wins where it saw the ground, GFSC fills clouds. */
+function pickCell(cells: SnowCells, products: Record<SnowProduct, boolean>) {
+  const fsc = products.FSC ? cells.FSC : undefined
+  const gfsc = products.GFSC ? cells.GFSC : undefined
+  if (fsc && (fsc.properties.valid_percent ?? 0) >= 50) return fsc
+  return gfsc ?? fsc ?? null
 }
 
 function observedLabel(value: string) {
@@ -223,6 +256,10 @@ function shortDate(value: string | null | undefined) {
   }).format(new Date(value))
 }
 
+function percent(value: number | null | undefined) {
+  return value == null ? "—" : `${value}%`
+}
+
 function productFilter(products: Record<SnowProduct, boolean>) {
   const active = (Object.keys(products) as SnowProduct[]).filter((product) => products[product])
   return ["in", ["get", "product"], ["literal", active]] as unknown as never
@@ -237,31 +274,78 @@ function snowApiBase() {
   return ""
 }
 
+async function fetchJson<T>(url: string, init?: RequestInit) {
+  const response = await fetch(url, init)
+  if (!response.ok) {
+    const detail = await response.json().then((body) => (body as { detail?: unknown } | null)?.detail).catch(() => null)
+    throw new Error(typeof detail === "string" ? detail : `Anfrage fehlgeschlagen (${response.status})`)
+  }
+  return await response.json() as T
+}
+
 export function SnowMap() {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const markersRef = useRef<Marker[]>([])
   const [viewStarted, setViewStarted] = useState(false)
-  const [snowData, setSnowData] = useState<SnowFeatureCollection>(demoSnowData)
-  const [selected, setSelected] = useState<SnowCellProperties>(demoSnowData.features[0].properties)
+  const [snapshotData, setSnapshotData] = useState<SnowFeatureCollection>(emptySnowData)
+  const [cells, setCells] = useState<SnowCells>({})
   const [basemap, setBasemap] = useState<BasemapMode>("map")
-  const [products, setProducts] = useState<Record<SnowProduct, boolean>>({ FSC: true, GFSC: false })
+  const [products, setProducts] = useState<Record<SnowProduct, boolean>>({ FSC: true, GFSC: true })
+  const [showClouds, setShowClouds] = useState(true)
   const [query, setQuery] = useState("")
-  const [searchHint, setSearchHint] = useState("Ort oder Koordinaten")
-  const [dataMode, setDataMode] = useState<DataMode>("demo")
+  const [dataMode, setDataMode] = useState<DataMode>("idle")
+  const [statusMessage, setStatusMessage] = useState("")
+  const [sourceKind, setSourceKind] = useState<"raster" | "geojson">("raster")
+  const [areaSummary, setAreaSummary] = useState<SnowAreaSummary | null>(null)
   const [searchBusy, setSearchBusy] = useState(false)
   const [searchError, setSearchError] = useState("")
+  const [layersOpen, setLayersOpen] = useState(false)
+  const layerPanelRef = useRef<HTMLElement>(null)
+  const basemapRef = useRef(basemap)
+  const apiBaseRef = useRef("")
+  const sourceKindRef = useRef<"raster" | "geojson">("raster")
   const productsRef = useRef(products)
-  const snowDataRef = useRef(snowData)
-  const selectedRef = useRef(selected)
+  const showCloudsRef = useRef(showClouds)
+  const dataVersionRef = useRef("0")
+  const snapshotDataRef = useRef(snapshotData)
+  const selectedRef = useRef<SnowCellFeature | null>(null)
+  const requestRef = useRef(0)
+  const lastPointRef = useRef<[number, number] | null>(null)
   const locationRef = useRef<{ center: [number, number]; zoom: number }>({ center: [11.1325, 47.531], zoom: 13.1 })
 
-  const totalCoverage = useMemo(() => {
-    const visible = snowData.features.filter((feature) => products[feature.properties.product])
-    if (!visible.length) return 0
-    const sum = visible.reduce((value, feature) => value + feature.properties.coverage_percent, 0)
-    return Math.round(sum / visible.length)
-  }, [products, snowData])
+  const selectedCell = useMemo(() => pickCell(cells, products), [cells, products])
+  const selected = selectedCell?.properties ?? null
+  const usedGapFill = selected?.product === "GFSC" && products.FSC && Boolean(cells.FSC)
+
+  const snapshotCoverage = useMemo(() => {
+    const visible = snapshotData.features.filter((feature) => products[feature.properties.product])
+    if (!visible.length) return null
+    const snowy = visible.filter((feature) => (feature.properties.coverage_percent ?? 0) > 0).length
+    return Math.round((100 * snowy) / visible.length)
+  }, [products, snapshotData])
+  const snowAreaPercent = sourceKind === "geojson" ? snapshotCoverage : areaSummary?.snow_area_percent ?? null
+
+  const activeLayerLabel = useMemo(() => {
+    const active = (Object.keys(products) as SnowProduct[]).filter((product) => products[product])
+    return active.length ? active.join("+") : "aus"
+  }, [products])
+
+  useEffect(() => {
+    if (!layersOpen) return
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!layerPanelRef.current?.contains(event.target as Node)) setLayersOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLayersOpen(false)
+    }
+    document.addEventListener("pointerdown", closeOnOutside)
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside)
+      document.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [layersOpen])
 
   const showFocusMarkers = useCallback((map: MapLibreMap, center: [number, number]) => {
     markersRef.current.forEach((marker) => marker.remove())
@@ -281,95 +365,174 @@ export function SnowMap() {
   }, [])
 
   const applyLayerState = useCallback((map: MapLibreMap) => {
+    if (map.getLayer("snow-raster")) {
+      const visible = snowMode(productsRef.current) !== null
+      map.setLayoutProperty("snow-raster", "visibility", visible ? "visible" : "none")
+      const source = map.getSource("snow-raster") as RasterTileSource | undefined
+      source?.setTiles([tileUrl(apiBaseRef.current, productsRef.current, showCloudsRef.current, dataVersionRef.current)])
+    }
     const filter = productFilter(productsRef.current)
-    snowLayerIds.forEach((id) => {
+    snapshotLayerIds.forEach((id) => {
       if (map.getLayer(id)) map.setFilter(id, filter)
     })
   }, [])
 
   const restoreSnowOverlay = useCallback((map: MapLibreMap) => {
-    addSnowLayers(map, snowDataRef.current)
+    addSnowLayers(map, sourceKindRef.current === "raster"
+      ? {
+          kind: "raster",
+          url: tileUrl(apiBaseRef.current, productsRef.current, showCloudsRef.current, dataVersionRef.current),
+          visible: snowMode(productsRef.current) !== null,
+        }
+      : { kind: "geojson", data: snapshotDataRef.current })
     applyLayerState(map)
-    if (map.getLayer("snow-selected")) {
-      map.setFilter("snow-selected", ["==", ["get", "cell_id"], selectedRef.current.cell_id])
-    }
+    const selection = map.getSource("snow-selection") as GeoJSONSource | undefined
+    selection?.setData(selectedRef.current ? { type: "FeatureCollection", features: [selectedRef.current] } : emptySelection)
   }, [applyLayerState])
 
+  const refreshSummary = useCallback(async () => {
+    const map = mapRef.current
+    const apiBase = apiBaseRef.current
+    const mode = snowMode(productsRef.current)
+    if (!map || !apiBase || sourceKindRef.current !== "raster" || !mode) {
+      setAreaSummary(null)
+      return
+    }
+    const bounds = map.getBounds()
+    const clamp = (value: number) => Math.max(-85, Math.min(85, value))
+    const params = new URLSearchParams({
+      west: String(Math.max(-180, bounds.getWest())), east: String(Math.min(180, bounds.getEast())),
+      south: String(clamp(bounds.getSouth())), north: String(clamp(bounds.getNorth())), mode,
+    })
+    try {
+      setAreaSummary(await fetchJson<SnowAreaSummary>(`${apiBase}/api/v1/snow/summary?${params}`))
+    } catch {
+      setAreaSummary(null)
+    }
+  }, [])
+
+  const queryPoint = useCallback(async (point: [number, number]) => {
+    lastPointRef.current = point
+    const params = new URLSearchParams({ lon: String(point[0]), lat: String(point[1]) })
+    const result = await fetchJson<SnowPointResult>(`${apiBaseRef.current}/api/v1/snow/point?${params}`)
+    setCells(result.cells)
+    return result
+  }, [])
+
+  const refreshDataVersion = useCallback(async () => {
+    const status = await fetchJson<{ data_version: string }>(`${apiBaseRef.current}/api/v1/snow/status`)
+    dataVersionRef.current = status.data_version
+    if (mapRef.current) applyLayerState(mapRef.current)
+  }, [applyLayerState])
+
+  const prepareArea = useCallback(async (point: [number, number], label: string) => {
+    const request = ++requestRef.current
+    setDataMode("preparing")
+    setStatusMessage("Frage WEkEO nach aktuellen Aufnahmen …")
+    try {
+      let job = await fetchJson<SnowAreaJob>(`${apiBaseRef.current}/api/v1/snow/areas`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ longitude: point[0], latitude: point[1] }),
+      })
+      while (job.state === "running") {
+        if (request !== requestRef.current) return
+        setStatusMessage(job.message)
+        await new Promise((resolve) => setTimeout(resolve, 2_000))
+        job = await fetchJson<SnowAreaJob>(`${apiBaseRef.current}/api/v1/snow/areas/${job.id}`)
+      }
+      if (request !== requestRef.current) return
+      if (job.state === "failed") throw new Error(job.message)
+      await refreshDataVersion()
+      const result = await queryPoint(point)
+      setDataMode(result.covered ? "live" : "unavailable")
+      setStatusMessage(result.covered ? label : "WEkEO hat für diesen Punkt keine gültigen Pixel geliefert.")
+      void refreshSummary()
+    } catch (error) {
+      if (request !== requestRef.current) return
+      setDataMode("unavailable")
+      setStatusMessage(error instanceof Error ? error.message : "Schneedaten konnten nicht geladen werden.")
+    }
+  }, [queryPoint, refreshSummary, refreshDataVersion])
+
   const showLocation = useCallback(async (center: [number, number], label: string, zoom = 13.2) => {
-    const mapCenter: [number, number] = insideFarchantSnapshot(center) ? [11.1325, 47.531] : center
-    locationRef.current = { center: mapCenter, zoom: insideFarchantSnapshot(center) ? 13.1 : zoom }
+    const request = ++requestRef.current
+    locationRef.current = { center, zoom }
     setViewStarted(true)
-    setSearchHint(label)
     setSearchError("")
+    setDataMode("loading")
+    setStatusMessage(label)
 
     requestAnimationFrame(() => {
       mapRef.current?.resize()
       if (mapRef.current) showFocusMarkers(mapRef.current, center)
-      mapRef.current?.flyTo({ center: mapCenter, zoom: locationRef.current.zoom, pitch: 30, bearing: -8, duration: 1_150 })
+      mapRef.current?.flyTo({ center, zoom, pitch: 30, bearing: -8, duration: 1_150 })
     })
-
-    const displayCollection = (collection: SnowFeatureCollection, mode: DataMode) => {
-      snowDataRef.current = collection
-      setSnowData(collection)
-      setDataMode(mode)
-      const source = mapRef.current?.getSource("snow-cells") as GeoJSONSource | undefined
-      source?.setData(collection)
-      if (!collection.features.length) return
-      const nearest = collection.features.reduce((best, feature) => {
-        const point = feature.geometry.coordinates[0]?.[0] ?? center
-        const bestPoint = best.geometry.coordinates[0]?.[0] ?? center
-        const distance = (point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2
-        const bestDistance = (bestPoint[0] - center[0]) ** 2 + (bestPoint[1] - center[1]) ** 2
-        return distance < bestDistance ? feature : best
-      })
-      setSelected(nearest.properties)
-    }
-
-    const loadFallback = async () => {
-      if (insideFarchantSnapshot(center)) {
-        try {
-          const response = await fetch("/data/farchant-snow.geojson")
-          if (!response.ok) throw new Error("Snapshot unavailable")
-          displayCollection(await response.json() as SnowFeatureCollection, "snapshot")
-          setSearchHint(`${label} · WEkEO-Snapshot`)
-          return
-        } catch {
-          // The clearly labelled demo below remains usable offline.
-        }
-      }
-      displayCollection(demoSnowData, "demo")
-      setSearchHint(`${label} · Demo-Daten`)
-    }
 
     const apiBase = snowApiBase()
-    if (!apiBase) {
-      await loadFallback()
-      return
+    if (apiBase) {
+      try {
+        const status = await fetchJson<{ data_version: string }>(`${apiBase}/api/v1/snow/status`)
+        if (request !== requestRef.current) return
+        apiBaseRef.current = apiBase
+        sourceKindRef.current = "raster"
+        setSourceKind("raster")
+        dataVersionRef.current = status.data_version
+        if (mapRef.current?.isStyleLoaded()) restoreSnowOverlay(mapRef.current)
+        const result = await queryPoint(center)
+        if (request !== requestRef.current) return
+        if (result.covered) {
+          setDataMode("live")
+          return
+        }
+        await prepareArea(center, label)
+        return
+      } catch {
+        // Backend not running: fall through to the static snapshot.
+      }
     }
 
-    const params = new URLSearchParams({
-      west: String(center[0] - 0.09), south: String(center[1] - 0.07),
-      east: String(center[0] + 0.09), north: String(center[1] + 0.07),
-    })
-    try {
-      const response = await fetch(`${apiBase}/api/v1/snow/cells?${params}`)
-      if (!response.ok) throw new Error("Snow API unavailable")
-      const payload = await response.json() as SnowFeatureCollection
-      if (!payload.features.length) {
-        await loadFallback()
-        return
+    apiBaseRef.current = ""
+    sourceKindRef.current = "geojson"
+    setSourceKind("geojson")
+    let collection = emptySnowData
+    if (insideFarchantSnapshot(center)) {
+      try {
+        collection = await fetchJson<SnowFeatureCollection>("/data/farchant-snow.geojson")
+      } catch {
+        collection = emptySnowData
       }
-      displayCollection(payload, "live")
-    } catch {
-      await loadFallback()
     }
-  }, [showFocusMarkers])
+    if (request !== requestRef.current) return
+    snapshotDataRef.current = collection
+    setSnapshotData(collection)
+    const map = mapRef.current
+    if (map?.isStyleLoaded()) {
+      restoreSnowOverlay(map)
+      ;(map.getSource("snow-cells") as GeoJSONSource | undefined)?.setData(collection)
+    }
+    if (!collection.features.length) {
+      setCells({})
+      setDataMode("unavailable")
+      setStatusMessage("Ohne lokales Backend gibt es nur den Farchant-Snapshot. Starte ./start.sh für alle Orte.")
+      return
+    }
+    const nearest = collection.features.reduce((best, feature) => {
+      const point = feature.geometry.coordinates[0]?.[0] ?? center
+      const bestPoint = best.geometry.coordinates[0]?.[0] ?? center
+      const distance = (point[0] - center[0]) ** 2 + (point[1] - center[1]) ** 2
+      const bestDistance = (bestPoint[0] - center[0]) ** 2 + (bestPoint[1] - center[1]) ** 2
+      return distance < bestDistance ? feature : best
+    })
+    setCells({ [nearest.properties.product]: nearest })
+    setDataMode("snapshot")
+  }, [prepareArea, queryPoint, restoreSnowOverlay, showFocusMarkers])
 
   useEffect(() => {
     if (!viewStarted || !containerRef.current || mapRef.current) return
     const map = new MapLibreMap({
       container: containerRef.current,
-      style: baseStyle("map"),
+      style: baseStyle(basemapRef.current),
       center: locationRef.current.center,
       zoom: locationRef.current.zoom,
       pitch: 28,
@@ -379,37 +542,56 @@ export function SnowMap() {
     })
     mapRef.current = map
     map.addControl(new AttributionControl({ compact: true }), "bottom-right")
+    let summaryTimer: ReturnType<typeof setTimeout> | undefined
     map.on("load", () => {
       restoreSnowOverlay(map)
       showFocusMarkers(map, locationRef.current.center)
     })
-    map.on("click", "snow-fill", (event) => {
-      const feature = event.features?.[0]
-      if (feature?.properties) setSelected(toProperties(feature.properties))
+    map.on("moveend", () => {
+      clearTimeout(summaryTimer)
+      summaryTimer = setTimeout(() => void refreshSummary(), 350)
     })
-    map.on("mouseenter", "snow-fill", () => { map.getCanvas().style.cursor = "pointer" })
-    map.on("mouseleave", "snow-fill", () => { map.getCanvas().style.cursor = "grab" })
+    map.on("click", (event) => {
+      if (sourceKindRef.current === "geojson") {
+        const feature = map.queryRenderedFeatures(event.point, { layers: ["snow-fill"] })[0]
+        if (!feature?.properties) return
+        const properties = toProperties(feature.properties)
+        setCells({
+          [properties.product]: {
+            type: "Feature",
+            id: properties.cell_id,
+            properties,
+            geometry: feature.geometry as SnowCellFeature["geometry"],
+          },
+        })
+        return
+      }
+      if (!apiBaseRef.current) return
+      void queryPoint([event.lngLat.lng, event.lngLat.lat]).catch(() => setCells({}))
+    })
+    map.getCanvas().style.cursor = "crosshair"
     return () => {
+      clearTimeout(summaryTimer)
       markersRef.current.forEach((marker) => marker.remove())
       markersRef.current = []
       map.remove()
       mapRef.current = null
     }
-  }, [restoreSnowOverlay, showFocusMarkers, viewStarted])
+  }, [queryPoint, refreshSummary, restoreSnowOverlay, showFocusMarkers, viewStarted])
 
-  useEffect(() => { snowDataRef.current = snowData }, [snowData])
-  useEffect(() => { selectedRef.current = selected }, [selected])
+  useEffect(() => { snapshotDataRef.current = snapshotData }, [snapshotData])
+  useEffect(() => {
+    selectedRef.current = selectedCell
+    const selection = mapRef.current?.getSource("snow-selection") as GeoJSONSource | undefined
+    selection?.setData(selectedCell ? { type: "FeatureCollection", features: [selectedCell] } : emptySelection)
+  }, [selectedCell])
   useEffect(() => {
     productsRef.current = products
+    showCloudsRef.current = showClouds
     const map = mapRef.current
     if (map?.isStyleLoaded()) applyLayerState(map)
-  }, [applyLayerState, products])
-  useEffect(() => {
-    const map = mapRef.current
-    if (map?.getLayer("snow-selected")) {
-      map.setFilter("snow-selected", ["==", ["get", "cell_id"], selected.cell_id])
-    }
-  }, [selected.cell_id])
+    void refreshSummary()
+  }, [applyLayerState, products, refreshSummary, showClouds])
 
   useEffect(() => {
     const context = document.modelContext
@@ -488,8 +670,6 @@ export function SnowMap() {
         }
         productsRef.current = next
         setProducts(next)
-        const map = mapRef.current
-        if (map?.isStyleLoaded()) applyLayerState(map)
         return { fsc: next.FSC, gfsc: next.GFSC }
       },
     })
@@ -503,19 +683,21 @@ export function SnowMap() {
         if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length > 0) {
           throw new Error("Dieses Werkzeug erwartet ein leeres Objekt.")
         }
-        return { ...selectedRef.current }
+        return selectedRef.current ? { ...selectedRef.current.properties } : { selected: null }
       },
     })
     return () => lifecycle.abort()
-  }, [applyLayerState, showLocation])
+  }, [showLocation])
 
   const changeBasemap = (next: BasemapMode) => {
     if (next === basemap) return
     setBasemap(next)
+    basemapRef.current = next
     const map = mapRef.current
     if (!map) return
-    map.setStyle(baseStyle(next))
+    // Object styles can finish loading synchronously, so listen before switching.
     map.once("style.load", () => restoreSnowOverlay(map))
+    map.setStyle(baseStyle(next))
   }
 
   const searchLocation = async (event: FormEvent) => {
@@ -542,24 +724,11 @@ export function SnowMap() {
           return
         }
       }
-      const apiBase = snowApiBase()
-      let match: { display_name: string; latitude: number; longitude: number }
-      if (apiBase) {
-        try {
-          const response = await fetch(`${apiBase}/api/v1/geocode/search?q=${encodeURIComponent(value)}`)
-          if (!response.ok) throw new Error("Local geocoder unavailable")
-          match = await response.json() as typeof match
-        } catch {
-          match = await geocodeAddress(value)
-        }
-      } else {
-        match = await geocodeAddress(value)
-      }
+      const match = await geocodeAddress(value)
       await showLocation([match.longitude, match.latitude], match.display_name, 13.2)
     } catch (error) {
       const message = error instanceof Error ? error.message : "Suche fehlgeschlagen."
       setSearchError(message)
-      setSearchHint(message)
     } finally {
       setSearchBusy(false)
     }
@@ -567,15 +736,19 @@ export function SnowMap() {
 
   const locate = () => {
     if (!navigator.geolocation) {
-      setSearchHint("Standort wird nicht unterstützt")
+      setSearchError("Standort wird nicht unterstützt")
       return
     }
-    setSearchHint("Standort wird gesucht …")
     navigator.geolocation.getCurrentPosition(
       ({ coords }) => { void showLocation([coords.longitude, coords.latitude], "Aktueller Standort", 13.2) },
-      () => setSearchHint("Standort konnte nicht geladen werden"),
+      () => setSearchError("Standort konnte nicht geladen werden"),
       { enableHighAccuracy: true, timeout: 8_000 },
     )
+  }
+
+  const reloadHere = () => {
+    const point = lastPointRef.current ?? locationRef.current.center
+    void prepareArea(point, "Aktualisiert")
   }
 
   if (!viewStarted) {
@@ -595,7 +768,7 @@ export function SnowMap() {
               autoFocus
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="z. B. Farchant oder 47.53, 11.11"
+              placeholder="z. B. Zugspitze oder 47.53, 11.11"
               aria-label="Ort, Adresse oder Koordinaten suchen"
             />
             <Button type="submit" disabled={searchBusy}>{searchBusy ? "Suche …" : "Karte öffnen"}</Button>
@@ -616,6 +789,15 @@ export function SnowMap() {
       </main>
     )
   }
+
+  const statusLabel = {
+    idle: "Bereit",
+    loading: "Lade Schneedaten …",
+    live: "WEkEO · lokale Daten",
+    snapshot: "WEkEO · Snapshot",
+    preparing: "WEkEO · Download läuft",
+    unavailable: "Keine Schneedaten",
+  }[dataMode]
 
   return (
     <main className="snow-app">
@@ -642,31 +824,55 @@ export function SnowMap() {
           <kbd>↵</kbd>
         </form>
         <div className="top-status">
-          <span className={dataMode !== "demo" ? "status-pulse is-live" : "status-pulse"} />
-          <span>{dataMode === "live" ? "WEkEO · lokale Daten" : dataMode === "snapshot" ? "WEkEO · Snapshot" : "MVP · Demo-Daten"}</span>
+          <span className={dataMode === "live" || dataMode === "snapshot" ? "status-pulse is-live" : "status-pulse"} />
+          <span>{statusLabel}</span>
         </div>
       </header>
 
-      <section className="layer-panel glass-panel" aria-labelledby="layers-title">
-        <div className="panel-heading">
+      <section ref={layerPanelRef} aria-label="Layer" className={layersOpen ? "layer-panel glass-panel is-open" : "layer-panel glass-panel"}>
+        <button
+          type="button"
+          className="panel-heading layer-toggle"
+          onClick={() => setLayersOpen((open) => !open)}
+          aria-expanded={layersOpen}
+          aria-controls="layer-menu"
+        >
           <span className="panel-icon"><Layers3 aria-hidden="true" /></span>
-          <div><p className="eyebrow">Layer</p><h1 id="layers-title">Schneebedeckung</h1></div>
-        </div>
-        <div className="layer-list">
-          <label className="layer-row">
-            <span className="layer-swatch fsc"><Snowflake aria-hidden="true" /></span>
-            <span><b>FSC</b><small>Fraktionaler Schnee · 20 m</small></span>
-            <Switch checked={products.FSC} onCheckedChange={(checked) => setProducts((current) => ({ ...current, FSC: checked }))} aria-label="FSC-Layer anzeigen" />
-          </label>
-          <label className="layer-row">
-            <span className="layer-swatch gfsc"><Snowflake aria-hidden="true" /></span>
-            <span><b>GFSC</b><small>Gap-filled Schnee · 60 m</small></span>
-            <Switch checked={products.GFSC} onCheckedChange={(checked) => setProducts((current) => ({ ...current, GFSC: checked }))} aria-label="GFSC-Layer anzeigen" />
-          </label>
-        </div>
-        <div className="coverage-summary">
-          <div><span>Ø sichtbare Kacheln</span><strong>{totalCoverage}%</strong></div>
-          <div className="coverage-track"><span style={{ width: `${totalCoverage}%` }} /></div>
+          <span className="layer-toggle-text">
+            <span className="eyebrow">Layer</span>
+            <b>Schneebedeckung</b>
+          </span>
+          <span className="layer-toggle-state">{activeLayerLabel}</span>
+          <ChevronDown className="layer-toggle-chevron" aria-hidden="true" />
+        </button>
+        <div id="layer-menu" className="layer-menu" hidden={!layersOpen}>
+          <div className="layer-list">
+            <label className="layer-row">
+              <span className="layer-swatch fsc"><Snowflake aria-hidden="true" /></span>
+              <span><b>FSC</b><small>Tagesaufnahme · 20 m</small></span>
+              <Switch checked={products.FSC} onCheckedChange={(checked) => setProducts((current) => ({ ...current, FSC: checked }))} aria-label="FSC-Layer anzeigen" />
+            </label>
+            <label className="layer-row">
+              <span className="layer-swatch gfsc"><Snowflake aria-hidden="true" /></span>
+              <span><b>GFSC</b><small>Lückengefüllt, 7 Tage · 60 m</small></span>
+              <Switch checked={products.GFSC} onCheckedChange={(checked) => setProducts((current) => ({ ...current, GFSC: checked }))} aria-label="GFSC-Layer anzeigen" />
+            </label>
+            <label className="layer-row">
+              <span className="layer-swatch cloud"><Cloud aria-hidden="true" /></span>
+              <span><b>Wolken</b><small>Schraffiert, wo nichts sichtbar ist</small></span>
+              <Switch checked={showClouds} onCheckedChange={setShowClouds} aria-label="Wolken anzeigen" />
+            </label>
+          </div>
+          {products.FSC && products.GFSC ? (
+            <p className="layer-note">FSC hat Vorrang. Wo FSC Wolken sieht, füllt GFSC auf.</p>
+          ) : null}
+          <div className="coverage-summary">
+            <div><span>Schneefläche im Ausschnitt</span><strong>{percent(snowAreaPercent)}</strong></div>
+            <div className="coverage-track"><span style={{ width: `${snowAreaPercent ?? 0}%` }} /></div>
+            {areaSummary && sourceKind === "raster" ? (
+              <small>Wolken {areaSummary.cloud_percent}% · keine Daten {areaSummary.nodata_percent}%</small>
+            ) : null}
+          </div>
         </div>
       </section>
 
@@ -683,26 +889,79 @@ export function SnowMap() {
       </div>
 
       <aside className="snow-detail glass-panel" aria-live="polite">
-        <div className="detail-topline">
-          <span className={`product-chip ${selected.product.toLowerCase()}`}>{selected.product}</span>
-          <span className="detail-age"><Clock3 /> {ageLabel(selected.observed_at)}</span>
-        </div>
-        <h2>{selected.region_name}</h2>
-        <p className="cell-id">Abschnitt {selected.cell_id}</p>
-        <div className="coverage-value"><span>{selected.coverage_percent}</span><sup>%</sup><p>mit Schnee bedeckt</p></div>
-        <div className="detail-meter"><span style={{ width: `${selected.coverage_percent}%` }} /></div>
-        <dl className="detail-grid">
-          <div><dt><Clock3 /> Aufnahme</dt><dd>{observedLabel(selected.observed_at)}</dd></div>
-          <div>
-            <dt><Cloud /> {selected.product === "GFSC" ? "AT-Zeitraum" : "Wolken"}</dt>
-            <dd>{selected.product === "GFSC" ? `${shortDate(selected.oldest_observed_at)}–${shortDate(selected.observed_at)}` : selected.cloud_percent == null ? "—" : `${selected.cloud_percent}%`}</dd>
+        {dataMode === "loading" || dataMode === "idle" ? (
+          <div className="detail-state">
+            <LoaderCircle className="spin" />
+            <b>Schneedaten werden abgefragt …</b>
+            <span>{statusMessage}</span>
           </div>
-          <div><dt><Database /> Quelle / Abschnitt</dt><dd>{selected.resolution_m} m / {selected.cell_size_m ?? "—"} m</dd></div>
-          <div><dt><MountainSnow /> Gültige Pixel</dt><dd>{selected.valid_percent == null ? "—" : `${selected.valid_percent}%`}</dd></div>
-        </dl>
+        ) : dataMode === "preparing" ? (
+          <div className="detail-state">
+            <CloudDownload />
+            <b>Lade Sentinel-2-Schneedaten für diesen Ort</b>
+            <span>Hier lag noch nichts lokal vor. Die neueste FSC- und GFSC-Aufnahme wird von WEkEO geladen, meist in 1–3 Minuten.</span>
+            <span className="detail-progress"><LoaderCircle className="spin" /> {statusMessage}</span>
+          </div>
+        ) : dataMode === "unavailable" ? (
+          <div className="detail-state">
+            <MapIcon />
+            <b>Keine Schneedaten für diesen Ort</b>
+            <span>{statusMessage}</span>
+            {sourceKind === "raster" ? (
+              <Button type="button" onClick={reloadHere}><RefreshCw /> Erneut versuchen</Button>
+            ) : (
+              <Button type="button" onClick={() => void showLocation([11.112, 47.531], "Farchant", 13.2)}>Farchant öffnen</Button>
+            )}
+          </div>
+        ) : !selected ? (
+          <div className="detail-state">
+            <Crosshair />
+            <b>Keine Daten an diesem Punkt</b>
+            <span>Klicke auf einen Bereich ohne graue Abdunklung, um Schneewerte abzufragen.</span>
+          </div>
+        ) : (
+          <>
+            <div className="detail-topline">
+              <span className={`product-chip ${selected.product.toLowerCase()}`}>{selected.product}</span>
+              <span className="detail-age"><Clock3 /> {ageLabel(selected.observed_at)}</span>
+            </div>
+            <h2>
+              {selected.coverage_percent == null
+                ? "Von Wolken verdeckt"
+                : selected.coverage_percent < 0.1 ? "Kein Schnee erkannt" : "Schnee erkannt"}
+            </h2>
+            <p className="cell-id">Abschnitt {selected.cell_id}</p>
+            <div className="coverage-value">
+              <span>{selected.coverage_percent ?? "—"}</span><sup>%</sup><p>mit Schnee bedeckt</p>
+            </div>
+            <div className="detail-meter"><span style={{ width: `${selected.coverage_percent ?? 0}%` }} /></div>
+            {usedGapFill ? <p className="detail-note">FSC ist hier bewölkt. Der Wert stammt aus dem lückengefüllten GFSC.</p> : null}
+            <dl className="detail-grid">
+              <div><dt><Clock3 /> Aufnahme</dt><dd>{observedLabel(selected.observed_at)}</dd></div>
+              <div>
+                <dt><Cloud /> {selected.product === "GFSC" ? "AT-Zeitraum" : "Wolken"}</dt>
+                <dd>{selected.product === "GFSC" ? `${shortDate(selected.oldest_observed_at)}–${shortDate(selected.observed_at)}` : percent(selected.cloud_percent)}</dd>
+              </div>
+              <div><dt><Database /> Quelle / Abschnitt</dt><dd>{selected.resolution_m} m / {selected.cell_size_m ?? "—"} m</dd></div>
+              <div><dt><MountainSnow /> Gültige Pixel</dt><dd>{percent(selected.valid_percent)}</dd></div>
+            </dl>
+            {dataMode === "live" ? (
+              <button type="button" className="detail-refresh" onClick={reloadHere}>
+                <RefreshCw /> Neueste Aufnahmen für diesen Ort laden
+              </button>
+            ) : null}
+          </>
+        )}
       </aside>
 
-      <div className="legend glass-panel" aria-label="Legende"><span>wenig</span><i className="legend-gradient" /><span>viel Schnee</span></div>
+      <div className="legend glass-panel" aria-label="Legende">
+        <span className="legend-title">Schnee %</span>
+        {snowClasses.map((item) => (
+          <span key={item.label} className="legend-item"><i style={{ background: item.color }} />{item.label}</span>
+        ))}
+        {showClouds ? <span className="legend-item"><i className="legend-cloud" />Wolken</span> : null}
+        <span className="legend-item"><i className="legend-nodata" />keine Daten</span>
+      </div>
       {searchError ? <output className="search-feedback" aria-live="polite">{searchError}</output> : null}
     </main>
   )

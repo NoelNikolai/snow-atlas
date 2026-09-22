@@ -13,5 +13,5 @@ def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
         service=settings.app_name,
         environment=settings.app_environment,
         credentials_configured=settings.credentials_configured,
-        processed_data_available=settings.processed_geojson.is_file(),
+        processed_data_available=(settings.scenes_dir / "catalog.json").is_file(),
     )
