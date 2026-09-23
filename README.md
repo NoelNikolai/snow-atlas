@@ -52,7 +52,7 @@ Danach startet ein Befehl Backend und Frontend zusammen und öffnet den Browser 
 ./start.sh
 ```
 
-Mit `./start.sh --no-open` öffnet sich kein Browser. Läuft einer der Dienste schon, verwendet das Skript ihn weiter.
+Mit `./start.sh --no-open` öffnet sich kein Browser. Laufen Backend oder Frontend schon (etwa aus einem anderen Terminal), beendet das Skript sie vorher und startet sie neu, damit Ctrl+C immer beides stoppt. Aus einem anderen Terminal lässt sich alles mit `./start.sh stop` beenden.
 
 Neueste Szenen für ein Gebiet vorab laden, zum Beispiel für das Wettersteingebirge mit Zugspitze:
 
